@@ -14,6 +14,7 @@ setup(
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
         (os.path.join('share', package_name, 'config'), glob('config/*.json')),
+        (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
         (os.path.join('share', package_name, 'skills'), glob('skills/*.pt')),
     ],
     install_requires=['setuptools'],
@@ -32,6 +33,7 @@ setup(
             'simple_move = so101_control.joint_command_publisher:main',
             'object_pose_estimation = so101_control.object_pose_publisher:main',
             'rl_control = so101_control.rl_control:main',
+            'move_home = so101_control.move_home:main',
         ],
     },
 )

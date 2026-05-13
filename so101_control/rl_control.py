@@ -1,9 +1,16 @@
 import os
+import csv
+import time
+import random
+
 import numpy as np
 import torch
-import torch.nn as nn
+import yaml
 import rclpy
+
 from rclpy.node import Node
+from packaging import version
+
 from geometry_msgs.msg import PoseStamped, PointStamped
 from std_msgs.msg import Float64MultiArray
 from sensor_msgs.msg import JointState
@@ -11,209 +18,270 @@ from sensor_msgs.msg import JointState
 import tf2_ros
 import tf2_geometry_msgs
 
+from gymnasium.spaces import Box
 
-# ---------------------------------------------------------------------------
-# Network — mirrors SharedModel from training output exactly:
-#
-#   net_container: LazyLinear(128) -> ELU -> LazyLinear(128) -> ELU  (shared trunk)
-#   policy_layer:  LazyLinear(act_dim)                               (policy head)
-#   log_std_parameter: Parameter(act_dim)                            (not used at inference)
-#
-# GaussianMixin with clip_actions=True applies tanh to policy_layer output
-# before returning mean_actions. We replicate that here.
-#
-# Checkpoint key structure (from skrl):
-#   policy/net_container.0.weight
-#   policy/net_container.0.bias
-#   policy/net_container.2.weight
-#   policy/net_container.2.bias
-#   policy/policy_layer.weight
-#   policy/policy_layer.bias
-#   policy/log_std_parameter
-# ---------------------------------------------------------------------------
-class PolicyNetwork(nn.Module):
-    def __init__(self, obs_dim: int, act_dim: int):
-        super().__init__()
-        self.net_container = nn.Sequential(
-            nn.Linear(obs_dim, 128),  # matches LazyLinear(128) after initialization
-            nn.ELU(),
-            nn.Linear(128, 128),
-            nn.ELU(),
-        )
-        self.policy_layer = nn.Linear(128, act_dim)
-        self.log_std_parameter = nn.Parameter(
-            torch.full((act_dim,), 0.0), requires_grad=False  # not needed at inference
+import skrl
+from skrl.utils.model_instantiators.torch import deterministic_model, gaussian_model, shared_model
+from skrl.resources.preprocessors.torch import RunningStandardScaler
+
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def _load_skrl_cfg(path: str) -> dict:
+    """Load and return the skrl config block from a YAML file."""
+    with open(path, "r") as f:
+        raw = yaml.safe_load(f)
+    return raw["skrl"]
+
+
+def _check_skrl_version(required: str) -> None:
+    if version.parse(skrl.__version__) < version.parse(required):
+        raise RuntimeError(
+            f"Unsupported skrl version: {skrl.__version__}. "
+            f"Install supported version using: pip install skrl>={required}"
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Mirrors: compute() returns raw output, then GaussianMixin.act() applies tanh
-        # because clip_actions=True
-        net = self.net_container(x)
-        raw = self.policy_layer(net)
-        return torch.tanh(raw)  # mean_actions in [-1, 1]
+
+def _seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
 
-# ---------------------------------------------------------------------------
-# Running Standard Scaler
-# ---------------------------------------------------------------------------
-class RunningStandardScaler:
-    def __init__(self, device):
-        self.device = device
-        self.running_mean     = None
-        self.running_variance = None
-        self.count            = None
+# =============================================================================
+# NODE
+# =============================================================================
 
-    def load(self, state_dict: dict, prefix: str):
-        self.running_mean     = state_dict[f'{prefix}running_mean'].to(self.device)
-        self.running_variance = state_dict[f'{prefix}running_variance'].to(self.device)
-        self.count            = state_dict[f'{prefix}count'].to(self.device)
-
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        std = torch.sqrt(self.running_variance / self.count.clamp(min=1))
-        return (x - self.running_mean) / (std + 1e-8)
-
-
-# ---------------------------------------------------------------------------
-# Action space configuration — matches Isaac Lab task config:
-#
-#   JointPositionActionCfg(scale=0.5, use_default_offset=True)
-#
-#   final_joint_pos = mean_action * ACTION_SCALE + DEFAULT_JOINT_POS
-#
-# DEFAULT_JOINT_POS: fill in from SO_ARM101_CFG init_state.joint_pos
-# ---------------------------------------------------------------------------
-ACTION_SCALE = 0.5
-
-DEFAULT_JOINT_POS = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])  # <-- UPDATE FROM SO_ARM101_CFG
-
-# Hardcoded gripper orientation command — must match sim ee_pose command format
-# Isaac Lab UniformPoseCommandCfg uses [x, y, z, qw, qx, qy, qz] internally
-# Verify this order matches your obs space by comparing to your frozen sim obs block
-GRIPPER_DOWN_QUAT = [1.0, 0.0, 0.0, 0.0]  # [qw, qx, qy, qz] for pitch=pi
-
-# Home pose — raw joint positions in radians sent directly to controller
-HOME_POSE = [-0.02, -1.81, 1.41, 0.98, 0.08, -0.61]
-
-EPISODE_DURATION   = 5.0   # seconds before homing
-HOME_HOLD_DURATION = 5.0   # seconds held at home before resuming
-
-
-# ---------------------------------------------------------------------------
 class RLControlNode(Node):
+
     def __init__(self):
-        super().__init__('rl_control_node')
+        super().__init__("rl_control_node")
 
-        # --- Parameters ---
-        self.declare_parameter('checkpoint_path', '')
-        self.declare_parameter('obs_dim', 25)
-        self.declare_parameter('act_dim', 6)
+        # LOAD CONFIG FILES
+        # ------------------------------------------------------------------ #
 
-        checkpoint_path = self.get_parameter('checkpoint_path').get_parameter_value().string_value
-        obs_dim         = self.get_parameter('obs_dim').get_parameter_value().integer_value
-        act_dim         = self.get_parameter('act_dim').get_parameter_value().integer_value
+        RL_CONFIG_PATH   = "/home/csrobot/ros2_so101_ws/src/so101-ros-physical-ai/so101_control/config/rl_control.yaml"
+        SKRL_CONFIG_PATH = "/home/csrobot/ros2_so101_ws/src/so101-ros-physical-ai/so101_control/config/skrl_cfg.yaml"
 
-        if not checkpoint_path or not os.path.exists(checkpoint_path):
-            self.get_logger().error(f'Checkpoint not found: {checkpoint_path}')
-            raise FileNotFoundError(checkpoint_path)
+        with open(RL_CONFIG_PATH) as f:
+            _rc = yaml.safe_load(f)["rl_control_node"]["ros__parameters"]
 
-        # --- Device ---
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        with open(SKRL_CONFIG_PATH) as f:
+            _skrl = yaml.safe_load(f)["skrl"]
 
-        # --- Load checkpoint ---
-        ckpt = torch.load(checkpoint_path, map_location=self.device)
-        self.get_logger().info(f'Checkpoint keys (first 20): {list(ckpt.keys())[:20]}')
+        # ------------------------------------------------------------------ #
+        # ROBOT / NODE PARAMETERS
+        # ------------------------------------------------------------------ #
+        self.declare_parameter("checkpoint_path", "")
+        self.checkpoint_path = self.get_parameter("checkpoint_path").get_parameter_value().string_value
 
-        # --- Build key mapping from checkpoint to our PolicyNetwork ---
-        # Checkpoint uses: policy/net_container.X.weight
-        # Our module uses: net_container.X.weight
-        # Also skip value_layer keys — we don't need them
-        policy_state = {}
-        for k, v in ckpt.items():
-            if not k.startswith('policy/'):
-                continue
-            new_key = k[len('policy/'):]
-            # Skip value head weights — not part of PolicyNetwork
-            if new_key.startswith('value_layer'):
-                continue
-            policy_state[new_key] = v
+        # self.checkpoint_path     = _rc["checkpoint_path"]
+        self.obs_dim             = _rc["obs_dim"]
+        self.act_dim             = _rc["act_dim"]
+        self.action_scale        = _rc["action_scale"]
+        self.control_hz          = _rc["control_hz"]
+        self.max_delta           = _rc["max_delta_per_step"]
+        self.max_abs_action      = _rc["max_abs_action"]
+        self.base_frame          = _rc["base_frame"]
+        self.camera_frame        = _rc["camera_frame"]
+        self.normalize_joint_pos = _rc["normalize_joint_pos"]
+        self.ee_log_path         = _rc["ee_log_path"]
+        self.pose_command        = list(_rc["pose_command"])
+        self.joint_names         = list(_rc["joint_names"])
+        self.default_joint_pos   = np.array(_rc["default_joint_pos"], dtype=np.float32)
+        self.joint_min           = np.array(_rc["joint_min"],          dtype=np.float32)
+        self.joint_max           = np.array(_rc["joint_max"],          dtype=np.float32)
+        self.joint_range         = self.joint_max - self.joint_min
 
-        self.get_logger().info(f'Policy state keys being loaded: {list(policy_state.keys())}')
+        # ------------------------------------------------------------------ #
+        # SKRL CONFIG
+        # ------------------------------------------------------------------ #
 
-        # --- Policy ---
-        self.policy = PolicyNetwork(obs_dim, act_dim).to(self.device)
-        missing, unexpected = self.policy.load_state_dict(policy_state, strict=False)
-        self.get_logger().info(f'Policy missing keys  : {missing}')
-        self.get_logger().info(f'Policy unexpected    : {unexpected}')
+        _check_skrl_version(_skrl["version"])
+        _seed_everything(_skrl["seed"])
 
-        # Flag any weight mismatches (log_std missing is fine, weight mismatches are not)
-        weight_missing = [k for k in missing if 'log_std' not in k]
-        if weight_missing:
-            self.get_logger().error(
-                f'WEIGHT MISMATCH — these keys did not load: {weight_missing}. '
-                f'Policy will produce garbage. Check architecture against checkpoint.'
-            )
-        else:
-            self.get_logger().info('All weight keys loaded successfully.')
+        models_cfg = _skrl["model"]
+        # agent_cfg kept for reference / future trainer use
+        # agent_cfg = _skrl["agent"]
 
+        # ------------------------------------------------------------------ #
+        # VALIDATE CHECKPOINT
+        # ------------------------------------------------------------------ #
+
+        if not self.checkpoint_path or not os.path.exists(self.checkpoint_path):
+            self.get_logger().error(f"Checkpoint not found: {self.checkpoint_path}")
+            raise FileNotFoundError(self.checkpoint_path)
+
+        # ------------------------------------------------------------------ #
+        # DEVICE
+        # ------------------------------------------------------------------ #
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.get_logger().info(f"Using device: {self.device}")
+
+        # ------------------------------------------------------------------ #
+        # LOAD CHECKPOINT
+        # ------------------------------------------------------------------ #
+
+        self.ckpt = torch.load(self.checkpoint_path, map_location=self.device)
+        self.get_logger().info(f"Checkpoint loaded from: {self.checkpoint_path}")
+        self.get_logger().info(f"Checkpoint keys: {list(self.ckpt.keys())}")
+
+        # ------------------------------------------------------------------ #
+        # BUILD OBSERVATION / ACTION SPACES
+        # ------------------------------------------------------------------ #
+
+        observation_space = Box(
+            low=-np.inf, high=np.inf,
+            shape=(self.obs_dim,), dtype=np.float32
+        )
+        action_space = Box(
+            low=-np.inf, high=np.inf,
+            shape=(self.act_dim,), dtype=np.float32
+        )
+
+        # ------------------------------------------------------------------ #
+        # BUILD & LOAD POLICY
+        # Trained with separate=false so we must use shared_model to match
+        # the checkpoint architecture (policy_layer + value_layer output heads
+        # on a shared trunk) — same as what the SKRL Runner builds internally.
+        # ------------------------------------------------------------------ #
+
+        self.policy = shared_model(
+            observation_space=observation_space,
+            action_space=action_space,
+            device=self.device,
+            roles=["policy", "value"],
+            parameters=[
+                models_cfg["policy"],
+                models_cfg["value"],
+            ],
+        )
+
+        policy_state_dict = (
+            self.ckpt["policy"]
+            if "policy" in self.ckpt
+            else {k.replace("policy.", ""): v
+                  for k, v in self.ckpt.items()
+                  if k.startswith("policy.")}
+        )
+
+        missing, unexpected = self.policy.load_state_dict(
+            policy_state_dict, strict=True
+        )
+        self.get_logger().info(f"Policy missing keys:    {missing}")
+        self.get_logger().info(f"Policy unexpected keys: {unexpected}")
         self.policy.eval()
 
-        # --- Observation scaler ---
-        self.obs_scaler = RunningStandardScaler(self.device)
+        # ------------------------------------------------------------------ #
+        # OBSERVATION PREPROCESSOR  (RunningStandardScaler)
+        # ------------------------------------------------------------------ #
+
+        self.obs_scaler = RunningStandardScaler(size=self.obs_dim, device=self.device)
+        self.use_scaler = False
+
         try:
-            self.obs_scaler.load(ckpt, prefix='state_preprocessor/')
+            scaler_state_dict = (
+                self.ckpt["state_preprocessor"]
+                if "state_preprocessor" in self.ckpt
+                else {k.replace("state_preprocessor.", ""): v
+                      for k, v in self.ckpt.items()
+                      if k.startswith("state_preprocessor.")}
+            )
+            self.obs_scaler.load_state_dict(scaler_state_dict)
             self.use_scaler = True
-            self.get_logger().info('Observation scaler loaded.')
-        except KeyError as e:
-            self.get_logger().warn(f'Scaler key not found ({e}) — running without scaling.')
-            self.use_scaler = False
+            self.get_logger().info("RunningStandardScaler loaded successfully")
 
-        # --- TF2 ---
-        self.tf_buffer   = tf2_ros.Buffer()
+        except Exception as e:
+            self.get_logger().warn(f"Failed to load scaler: {e}")
+            self.get_logger().warn("Proceeding WITHOUT observation normalization")
+
+        # ------------------------------------------------------------------ #
+        # TF2
+        # ------------------------------------------------------------------ #
+
+        self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-        self.base_frame   = 'follower/base_link'
-        self.camera_frame = 'follower/cam_wrist'
 
-        # --- State ---
-        self.joint_pos       = [0.0] * 6
-        self.joint_vel       = [0.0] * 6
-        self.object_xyz      = [0.0, 0.0, 0.0]
+        # ------------------------------------------------------------------ #
+        # STATE
+        # ------------------------------------------------------------------ #
+
+        self.joint_pos   = [0.0] * self.act_dim
+        self.joint_vel   = [0.0] * self.act_dim
+        self.object_xyz  = [0.0, 0.0, 0.0]
         self.object_received = False
-        # Stores the previous *policy output* (tanh'd, [-1,1]) — NOT joint targets
-        # This is what the sim echoes back in obs[19:25]
-        self.prev_actions    = [0.0] * act_dim
+        self.prev_actions = [0.0] * self.act_dim
+        self.timestep = 0
 
-        # --- Episode timing ---
-        self.mode          = 'policy'
-        self.episode_start = self.get_clock().now()
-        self.home_start    = None
+        # ------------------------------------------------------------------ #
+        # EE LOGGING
+        # ------------------------------------------------------------------ #
 
-        # --- ROS topics ---
-        self.create_subscription(JointState,  '/follower/joint_states', self.joint_state_callback, 10)
-        self.create_subscription(PoseStamped, '/object_pose',           self.pose_callback,        10)
-        self.pub   = self.create_publisher(Float64MultiArray, '/follower/forward_controller/commands', 10)
-        # 50 Hz to match Isaac Lab default control frequency
-        self.timer = self.create_timer(0.02, self.timer_callback)
+        self.ee_frame = "follower/gripper_frame_link"
+        self._ee_log  = []
+        self._t0      = time.monotonic()
 
-        self.get_logger().info(f'Ready | obs_dim={obs_dim} act_dim={act_dim} device={self.device}')
-        self.get_logger().info(
-            f'Action pipeline: tanh(policy_layer(net_container(obs))) '
-            f'* {ACTION_SCALE} + {DEFAULT_JOINT_POS.tolist()}'
+        # ------------------------------------------------------------------ #
+        # ROS TOPICS
+        # ------------------------------------------------------------------ #
+
+        self.create_subscription(
+            JointState, "/follower/joint_states",
+            self.joint_state_callback, 10
+        )
+        self.create_subscription(
+            PoseStamped, "/object_pose",
+            self.pose_callback, 10
         )
 
-    # -----------------------------------------------------------------------
+        self.pub = self.create_publisher(
+            Float64MultiArray,
+            "/follower/forward_controller/commands", 10
+        )
+
+        self.timer = self.create_timer(
+            1.0 / self.control_hz,
+            self.timer_callback
+        )
+
+        self.get_logger().info(
+            f"RLControlNode ready | "
+            f"obs_dim={self.obs_dim} act_dim={self.act_dim} freq={self.control_hz}Hz"
+        )
+
+    # =========================================================================
+    # CALLBACKS
+    # =========================================================================
+
     def joint_state_callback(self, msg: JointState):
-        if len(msg.position) >= 6:
-            self.joint_pos = list(msg.position[:6])
-        if len(msg.velocity) >= 6:
-            self.joint_vel = list(msg.velocity[:6])
+        name_to_index = {name: i for i, name in enumerate(msg.name)}
+        missing = [n for n in self.joint_names if n not in name_to_index]
+
+        if missing:
+            self.get_logger().warn(
+                f"Missing joints: {missing}", throttle_duration_sec=2.0
+            )
+            return
+
+        self.joint_pos = [
+            float(msg.position[name_to_index[n]]) for n in self.joint_names
+        ]
+        self.joint_vel = (
+            [float(msg.velocity[name_to_index[n]]) for n in self.joint_names]
+            if len(msg.velocity) >= len(msg.name)
+            else [0.0] * len(self.joint_names)
+        )
 
     def pose_callback(self, msg: PoseStamped):
         point_in_cam = PointStamped()
-        point_in_cam.header          = msg.header
+        point_in_cam.header = msg.header
         point_in_cam.header.frame_id = self.camera_frame
-        point_in_cam.point.x         = msg.pose.position.x
-        point_in_cam.point.y         = msg.pose.position.y
-        point_in_cam.point.z         = msg.pose.position.z
+        point_in_cam.point.x = msg.pose.position.x
+        point_in_cam.point.y = msg.pose.position.y
+        point_in_cam.point.z = msg.pose.position.z
 
         try:
             transform = self.tf_buffer.lookup_transform(
@@ -222,95 +290,139 @@ class RLControlNode(Node):
                 time=rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=0.05),
             )
-            point_in_base   = tf2_geometry_msgs.do_transform_point(point_in_cam, transform)
-            self.object_xyz = [point_in_base.point.x,
-                               point_in_base.point.y,
-                               point_in_base.point.z]
+            pt = tf2_geometry_msgs.do_transform_point(point_in_cam, transform)
+            self.object_xyz = [pt.point.x, pt.point.y, pt.point.z]
             self.object_received = True
-            self.get_logger().debug(
-                f'Object in base frame: {[f"{v:.4f}" for v in self.object_xyz]}'
-            )
-        except (tf2_ros.LookupException,
-                tf2_ros.ExtrapolationException,
-                tf2_ros.ConnectivityException) as e:
-            self.get_logger().warn(f'TF error: {e}', throttle_duration_sec=2.0)
 
-    # -----------------------------------------------------------------------
-    def _publish(self, commands: list):
-        out      = Float64MultiArray()
-        out.data = commands
-        self.pub.publish(out)
+        except (
+            tf2_ros.LookupException,
+            tf2_ros.ExtrapolationException,
+            tf2_ros.ConnectivityException,
+        ) as e:
+            self.get_logger().warn(f"TF error: {e}", throttle_duration_sec=2.0)
 
-    def _elapsed(self, since) -> float:
-        return (self.get_clock().now() - since).nanoseconds * 1e-9
+    # =========================================================================
+    # CONTROL LOOP
+    # =========================================================================
 
-    # -----------------------------------------------------------------------
     def timer_callback(self):
-
-        # ---- HOMING mode ----
-        if self.mode == 'homing':
-            self._publish(HOME_POSE)
-            if self._elapsed(self.home_start) >= HOME_HOLD_DURATION:
-                self.get_logger().info('Home hold complete — resuming policy.')
-                self.prev_actions  = [0.0] * 6
-                self.episode_start = self.get_clock().now()
-                self.mode          = 'policy'
-            return
-
-        # ---- POLICY mode ----
         if not self.object_received:
-            self.get_logger().warn('Waiting for object pose...', throttle_duration_sec=2.0)
-            return
-
-        if self._elapsed(self.episode_start) >= EPISODE_DURATION:
-            self.get_logger().info(
-                f'Episode complete ({EPISODE_DURATION}s) — returning to home pose.'
+            self.get_logger().warn(
+                "Waiting for object pose...", throttle_duration_sec=2.0
             )
-            self.mode       = 'homing'
-            self.home_start = self.get_clock().now()
-            self._publish(HOME_POSE)
             return
 
-        # --- Build observation — must match sim obs space exactly ---
-        # [joint_pos(6), joint_vel(6), ee_pose_command(7), prev_actions(6)] = 25
-        pose_command = self.object_xyz + GRIPPER_DOWN_QUAT
-        obs = (
-            self.joint_pos   +   # 6  joint positions (rad)
-            self.joint_vel   +   # 6  joint velocities (rad/s)
-            pose_command     +   # 7  target ee pose in robot base frame
-            self.prev_actions    # 6  previous policy output (tanh'd, [-1, 1])
+        # --- Build observation -----------------------------------------------
+        joint_pos_np = np.array(self.joint_pos, dtype=np.float32)
+        joint_vel_np = np.array(self.joint_vel, dtype=np.float32)
+
+        joint_pos_rel = (
+            (joint_pos_np - self.default_joint_pos) / (self.joint_range + 1e-8)
+            if self.normalize_joint_pos
+            else joint_pos_np - self.default_joint_pos
         )
+
+        pose_cmd = list(self.pose_command)
+
+        obs = (
+            joint_pos_rel.tolist()
+            + joint_vel_np.tolist()
+            + pose_cmd
+            + self.prev_actions
+        )
+
+        if self.timestep < 3:
+            self.get_logger().info(f"OBS: {obs}")
+
 
         obs_tensor = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
 
         if self.use_scaler:
             obs_tensor = self.obs_scaler(obs_tensor)
 
+        # --- Policy inference ------------------------------------------------
         with torch.inference_mode():
-            # forward() = tanh(policy_layer(net_container(obs)))
-            # output is mean_actions in [-1, 1], matching skrl clip_actions=True
-            mean_action = self.policy(obs_tensor).squeeze(0).cpu().numpy()
+            outputs = self.policy.act(
+                {"states": obs_tensor, "observations": obs_tensor},
+                role="policy",
+            )
+            actions    = outputs[-1].get("mean_actions", outputs[0])
+            mean_action = actions.squeeze(0).detach().cpu().numpy()
 
-        # --- Replicate JointPositionActionCfg(scale=0.5, use_default_offset=True) ---
-        joint_target = mean_action * ACTION_SCALE + DEFAULT_JOINT_POS
+        if not np.all(np.isfinite(mean_action)):
+            self.get_logger().error(f"Non-finite action: {mean_action}")
+            return
 
-        self.get_logger().info(
-            f'[{self._elapsed(self.episode_start):.1f}s/{EPISODE_DURATION}s] '
-            f'mean_action={[f"{a:.3f}" for a in mean_action.tolist()]} | '
-            f'joint_target={[f"{j:.3f}" for j in joint_target.tolist()]}'
-        )
+        # --- Clip, scale, rate-limit, publish --------------------------------
+        safe_action  = np.clip(mean_action, -self.max_abs_action, self.max_abs_action)
+        joint_target = safe_action * self.action_scale + self.default_joint_pos
 
-        # Store policy output (NOT joint target) for next obs
-        self.prev_actions = mean_action.tolist()
+        if self.max_delta > 0.0:
+            current      = np.array(self.joint_pos, dtype=np.float32)
+            joint_target = current + np.clip(joint_target - current, -self.max_delta, self.max_delta)
 
         self._publish(joint_target.tolist())
 
-    # -----------------------------------------------------------------------
+        # Isaac Lab stores raw network action as prev_actions
+        self.prev_actions = mean_action.tolist()
+        self.timestep += 1
+
+        # --- Log EE trajectory -----------------------------------------------
+        ee_xyz = self._lookup_ee_pose()
+        if ee_xyz is not None:
+            desired = self.pose_command[:3]
+            self._ee_log.append((
+                round(time.monotonic() - self._t0, 4),
+                round(ee_xyz[0], 6), round(ee_xyz[1], 6), round(ee_xyz[2], 6),
+                round(desired[0], 6), round(desired[1], 6), round(desired[2], 6),
+            ))
+
+    # =========================================================================
+    # UTILITIES
+    # =========================================================================
+
+    def _publish(self, commands):
+        target = np.clip(np.array(commands, dtype=np.float32), self.joint_min, self.joint_max)
+        msg = Float64MultiArray()
+        msg.data = target.tolist()
+        self.pub.publish(msg)
+        return target
+
+    def _lookup_ee_pose(self):
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                target_frame=self.base_frame,
+                source_frame=self.ee_frame,
+                time=rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.0),
+            )
+            t = transform.transform.translation
+            return (t.x, t.y, t.z)
+        except (tf2_ros.LookupException, tf2_ros.ExtrapolationException, tf2_ros.ConnectivityException):
+            return None
+
+    def _flush_ee_log(self):
+        if not self._ee_log:
+            self.get_logger().info("No EE trajectory data to write")
+            return
+        try:
+            with open(self.ee_log_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["timestamp_s", "ee_x", "ee_y", "ee_z", "desired_x", "desired_y", "desired_z"])
+                writer.writerows(self._ee_log)
+            self.get_logger().info(f"Saved EE trajectory: {self.ee_log_path}")
+        except OSError as e:
+            self.get_logger().error(f"Failed to write EE log: {e}")
+
     def destroy_node(self):
+        self._flush_ee_log()
         super().destroy_node()
 
 
-# ---------------------------------------------------------------------------
+# =============================================================================
+# MAIN
+# =============================================================================
+
 def main(args=None):
     rclpy.init(args=args)
     node = RLControlNode()
@@ -322,5 +434,6 @@ def main(args=None):
         node.destroy_node()
         rclpy.shutdown()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

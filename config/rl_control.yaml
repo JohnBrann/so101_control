@@ -1,0 +1,52 @@
+# =============================================================================
+# RL Control Node — Robot & Node Parameters
+# Loaded by RLControlNode at startup
+# =============================================================================
+
+rl_control_node:
+  ros__parameters:
+
+    # --- Checkpoint -----------------------------------------------------------
+    checkpoint_path: ""
+
+    # --- Observation / Action Space -------------------------------------------
+    obs_dim: 25
+    act_dim: 6
+
+    # --- Action Scaling -------------------------------------------------------
+    action_scale: 0.5
+    max_delta_per_step: 0.25
+    max_abs_action: 5.0
+
+    # --- Joint Configuration --------------------------------------------------
+    default_joint_pos: [0.0, 0.0, 0.0, 1.57, 0.0, 0.0]
+    joint_min: [-1.728, -1.571, -1.521, -1.492, -2.470, -0.158]
+    joint_max: [ 1.728,  1.571,  1.521,  1.492,  2.557,  1.571]
+    joint_names:
+      - shoulder_pan
+      - shoulder_lift
+      - elbow_flex
+      - wrist_flex
+      - wrist_roll
+      - gripper
+
+    # --- Task Command ---------------------------------------------------------
+    # [x, y, z, qx, qy, qz, qw]
+    pose_command: [0.22973, -0.1, 0.062228, 0.0, 0.0, 1.0, 0.0]
+
+    # --- Frames ---------------------------------------------------------------
+    base_frame: "follower/base_link"
+    camera_frame: "follower/cam_wrist"
+
+    # --- Observation Preprocessing --------------------------------------------
+    normalize_joint_pos: false
+
+    # --- Control --------------------------------------------------------------
+    control_hz: 50.0
+
+    # --- Logging --------------------------------------------------------------
+    ee_log_path: "ee_trajectory.csv"
+
+    # --- SKRL Config File -----------------------------------------------------
+    # Path to skrl_cfg.yaml (model + agent hyper-parameters)
+    skrl_cfg_path: "skrl_cfg.yaml"

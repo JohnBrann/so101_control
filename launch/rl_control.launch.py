@@ -155,5 +155,5 @@ def generate_launch_description():
         cameras_launch,
         rviz_node,
         object_pose_node,
-        rl_control_start,
+        # rl_control_start,
     ])
