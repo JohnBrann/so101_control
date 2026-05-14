@@ -58,7 +58,7 @@ class RLControlNode(Node):
 
     def __init__(self):
         super().__init__("rl_control_node")
-
+        # ------------------------------------------------------------------ #
         # LOAD CONFIG FILES
         # ------------------------------------------------------------------ #
 
@@ -88,7 +88,7 @@ class RLControlNode(Node):
         self.camera_frame        = _rc["camera_frame"]
         self.normalize_joint_pos = _rc["normalize_joint_pos"]
         self.ee_log_path         = _rc["ee_log_path"]
-        self.pose_command        = list(_rc["pose_command"])
+        # self.pose_command        = list(_rc["pose_command"])
         self.joint_names         = list(_rc["joint_names"])
         self.default_joint_pos   = np.array(_rc["default_joint_pos"], dtype=np.float32)
         self.joint_min           = np.array(_rc["joint_min"],          dtype=np.float32)
@@ -119,6 +119,7 @@ class RLControlNode(Node):
         # ------------------------------------------------------------------ #
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # self.device = torch.device("cpu")
         self.get_logger().info(f"Using device: {self.device}")
 
         # ------------------------------------------------------------------ #
@@ -174,6 +175,7 @@ class RLControlNode(Node):
         self.get_logger().info(f"Policy missing keys:    {missing}")
         self.get_logger().info(f"Policy unexpected keys: {unexpected}")
         self.policy.eval()
+        self.policy = self.policy.to(self.device)
 
         # ------------------------------------------------------------------ #
         # OBSERVATION PREPROCESSOR  (RunningStandardScaler)
@@ -216,6 +218,10 @@ class RLControlNode(Node):
         self.prev_actions = [0.0] * self.act_dim
         self.timestep = 0
 
+        # used for pose that we get from /pose topic 
+        self.pose_command    = [0.0, 0.0, 0.0]
+        self.pose_received   = False
+
         # ------------------------------------------------------------------ #
         # EE LOGGING
         # ------------------------------------------------------------------ #
@@ -234,6 +240,11 @@ class RLControlNode(Node):
         )
         self.create_subscription(
             PoseStamped, "/object_pose",
+            self.object_pose_callback, 10
+        )
+
+        self.create_subscription(
+            PoseStamped, "/pose",
             self.pose_callback, 10
         )
 
@@ -275,7 +286,7 @@ class RLControlNode(Node):
             else [0.0] * len(self.joint_names)
         )
 
-    def pose_callback(self, msg: PoseStamped):
+    def object_pose_callback(self, msg: PoseStamped):
         point_in_cam = PointStamped()
         point_in_cam.header = msg.header
         point_in_cam.header.frame_id = self.camera_frame
@@ -301,12 +312,29 @@ class RLControlNode(Node):
         ) as e:
             self.get_logger().warn(f"TF error: {e}", throttle_duration_sec=2.0)
 
+
+
+
+    def pose_callback(self, msg: PoseStamped):
+        self.pose_command = [
+            msg.pose.position.x,
+            msg.pose.position.y,
+            msg.pose.position.z,
+            msg.pose.orientation.x,
+            msg.pose.orientation.y,
+            msg.pose.orientation.z,
+            msg.pose.orientation.w,
+        ]
+        self.pose_received = True
+
+
     # =========================================================================
     # CONTROL LOOP
     # =========================================================================
 
     def timer_callback(self):
-        if not self.object_received:
+        # if not self.object_received or not self.pose_received:
+        if not self.pose_received:  
             self.get_logger().warn(
                 "Waiting for object pose...", throttle_duration_sec=2.0
             )
@@ -322,12 +350,12 @@ class RLControlNode(Node):
             else joint_pos_np - self.default_joint_pos
         )
 
-        pose_cmd = list(self.pose_command)
+        pose = list(self.pose_command)
 
         obs = (
             joint_pos_rel.tolist()
             + joint_vel_np.tolist()
-            + pose_cmd
+            + pose
             + self.prev_actions
         )
 
@@ -338,7 +366,7 @@ class RLControlNode(Node):
         obs_tensor = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
 
         if self.use_scaler:
-            obs_tensor = self.obs_scaler(obs_tensor)
+            obs_tensor = self.obs_scaler(obs_tensor).to(self.device)
 
         # --- Policy inference ------------------------------------------------
         with torch.inference_mode():
@@ -370,7 +398,7 @@ class RLControlNode(Node):
         # --- Log EE trajectory -----------------------------------------------
         ee_xyz = self._lookup_ee_pose()
         if ee_xyz is not None:
-            desired = self.pose_command[:3]
+            desired = pose[:3]
             self._ee_log.append((
                 round(time.monotonic() - self._t0, 4),
                 round(ee_xyz[0], 6), round(ee_xyz[1], 6), round(ee_xyz[2], 6),

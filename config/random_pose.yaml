@@ -1,0 +1,8 @@
+random_pose_node:
+  ros__parameters:
+    random_pose: False
+    set_pose: [0.2, 0.0, 0.05]
+    workspace:
+      x_bounds: [0.05, 0.25]
+      y_bounds: [-0.10, 0.10]
+      z_bounds: [0.04, 0.10]

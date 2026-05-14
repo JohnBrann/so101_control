@@ -34,6 +34,7 @@ setup(
             'object_pose_estimation = so101_control.object_pose_publisher:main',
             'rl_control = so101_control.rl_control:main',
             'move_home = so101_control.move_home:main',
+            'random_pose = so101_control.random_pose_publisher:main',
         ],
     },
 )

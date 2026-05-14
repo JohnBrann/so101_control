@@ -98,6 +98,14 @@ def generate_launch_description():
         output="screen",
     )
 
+    # --- random pose publisher ---
+    random_pose_node = Node(
+        package="so101_control",
+        executable="random_pose",
+        name="random_pose",
+        output="screen",
+    )
+
     # --- RL control node — delayed so joints/TF are ready first ---
     rl_control_node = Node(
         package="so101_control",
@@ -154,6 +162,7 @@ def generate_launch_description():
         camera_tf_launch,
         cameras_launch,
         rviz_node,
-        object_pose_node,
+        # object_pose_node,
         # rl_control_start,
+        random_pose_node,
     ])
